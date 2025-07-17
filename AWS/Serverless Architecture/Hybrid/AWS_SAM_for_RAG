@@ -1,0 +1,597 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  
+  LLMType:
+    Type: String
+    Default: external
+    AllowedValues: [external, onprem, hybrid]
+    Description: LLM deployment type (external=cloud APIs, onprem=on-premise, hybrid=both)
+  
+  ExternalLLMApiEndpoint:
+    Type: String
+    Default: "https://api.openai.com/v1"
+    Description: External LLM API endpoint (e.g., OpenAI, Anthropic)
+  
+  OnPremLLMEndpoint:
+    Type: String
+    Default: ""
+    Description: On-premise LLM endpoint (e.g., http://internal-llm.company.com:8080)
+  
+  OnPremVPCId:
+    Type: String
+    Default: ""
+    Description: VPC ID for on-premise LLM connectivity (leave empty for external only)
+  
+  OnPremSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Private subnet IDs for on-premise LLM connectivity
+  
+  SSODomain:
+    Type: String
+    Description: SSO domain for authentication
+  
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: "https://localhost:3000"
+    Description: Allowed CORS origins
+  
+  LoadBalancingStrategy:
+    Type: String
+    Default: primary_fallback
+    AllowedValues: [primary_fallback, round_robin, cost_optimized]
+    Description: Load balancing strategy for hybrid deployments
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        VECTOR_INDEX_NAME: !Sub "${AWS::StackName}-vectors"
+        DOCUMENTS_BUCKET: !Ref DocumentsBucket
+        LLM_TYPE: !Ref LLMType
+        EXTERNAL_LLM_ENDPOINT: !Ref ExternalLLMApiEndpoint
+        ONPREM_LLM_ENDPOINT: !Ref OnPremLLMEndpoint
+        LOAD_BALANCING_STRATEGY: !Ref LoadBalancingStrategy
+
+Conditions:
+  UseOnPremLLM: !Or
+    - !Equals [!Ref LLMType, "onprem"]
+    - !Equals [!Ref LLMType, "hybrid"]
+  UseExternalLLM: !Or
+    - !Equals [!Ref LLMType, "external"]
+    - !Equals [!Ref LLMType, "hybrid"]
+  CreateVPC: !And
+    - !Condition UseOnPremLLM
+    - !Equals [!Ref OnPremVPCId, ""]
+  # VPC Configuration for On-Premise Connectivity (Conditional)
+  VPCConfig:
+    Type: AWS::EC2::VPC
+    Condition: UseOnPremLLM
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: UseOnPremLLM
+    Properties:
+      VpcId: !If [UseOnPremLLM, !Ref VPCConfig, !Ref OnPremVPCId]
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-subnet-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: UseOnPremLLM
+    Properties:
+      VpcId: !If [UseOnPremLLM, !Ref VPCConfig, !Ref OnPremVPCId]
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-private-subnet-2"
+
+  # NAT Gateway for outbound internet access
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: UseOnPremLLM
+    Properties:
+      AllocationId: !GetAtt EIPForNAT.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  EIPForNAT:
+    Type: AWS::EC2::EIP
+    Condition: UseOnPremLLM
+    Properties:
+      Domain: vpc
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: UseOnPremLLM
+    Properties:
+      VpcId: !Ref VPCConfig
+      CidrBlock: 10.0.100.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-subnet-1"
+
+  # Security Group for Lambda functions
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseOnPremLLM
+    Properties:
+      GroupDescription: Security group for Lambda functions accessing on-premise LLM
+      VpcId: !If [UseOnPremLLM, !Ref VPCConfig, !Ref OnPremVPCId]
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 10.0.0.0/8  # Adjust for your on-premise network
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-lambda-sg"
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-documents-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentProcessorFunction.Arn
+
+  # OpenSearch Serverless Collection
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Name: !Sub "${AWS::StackName}-vectors"
+      Type: VECTORSEARCH
+      Description: Vector search collection for RAG application
+
+  # Cognito User Pool for Authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${AWS::StackName}-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # API Gateway
+  RagApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: !Sub "'${AllowedOrigins}'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigins}'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigins}'"
+
+  # Lambda Functions
+  DocumentProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-document-processor"
+      CodeUri: src/document_processor/
+      Handler: app.lambda_handler
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref DocumentsBucket
+            Events: s3:ObjectCreated:*
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentsBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - aoss:APIAccessAll
+              Resource: !GetAtt OpenSearchCollection.Arn
+
+  QueryProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-query-processor"
+      CodeUri: src/query_processor/
+      Handler: app.lambda_handler
+      Timeout: 120
+      MemorySize: 1024
+      VpcConfig: !If
+        - UseOnPremLLM
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds: !If
+            - UseOnPremLLM
+            - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+            - !Ref OnPremSubnetIds
+        - !Ref "AWS::NoValue"
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RagApi
+            Path: /query
+            Method: POST
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          LLM_CONFIG_SECRET: !Ref LLMConfiguration
+          LLM_USAGE_TABLE: !Ref LLMUsageTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - aoss:APIAccessAll
+              Resource: !GetAtt OpenSearchCollection.Arn
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref LLMConfiguration
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+              Resource: !GetAtt LLMUsageTable.Arn
+            - Effect: Allow
+              Action:
+                - ec2:CreateNetworkInterface
+                - ec2:DescribeNetworkInterfaces
+                - ec2:DeleteNetworkInterface
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  'aws:RequestedRegion': !Ref 'AWS::Region'
+
+  EmbeddingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-embedding-generator"
+      CodeUri: src/embedding_generator/
+      Handler: app.lambda_handler
+      Timeout: 120
+      MemorySize: 1024
+      VpcConfig: !If
+        - UseOnPremLLM
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds: !If
+            - UseOnPremLLM
+            - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+            - !Ref OnPremSubnetIds
+        - !Ref "AWS::NoValue"
+      Environment:
+        Variables:
+          LLM_CONFIG_SECRET: !Ref LLMConfiguration
+          LLM_USAGE_TABLE: !Ref LLMUsageTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref LLMConfiguration
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:UpdateItem
+              Resource: !GetAtt LLMUsageTable.Arn
+            - Effect: Allow
+              Action:
+                - ec2:CreateNetworkInterface
+                - ec2:DescribeNetworkInterfaces
+                - ec2:DeleteNetworkInterface
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  'aws:RequestedRegion': !Ref 'AWS::Region'
+
+  # Health Check Function for LLM Endpoints
+  LLMHealthCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-llm-health-check"
+      CodeUri: src/llm_health_check/
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      VpcConfig: !If
+        - UseOnPremLLM
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds: !If
+            - UseOnPremLLM
+            - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+            - !Ref OnPremSubnetIds
+        - !Ref "AWS::NoValue"
+      Events:
+        HealthCheckSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Input: !Sub |
+              {
+                "llm_config_secret": "${LLMConfiguration}",
+                "usage_table": "${LLMUsageTable}"
+              }
+      Environment:
+        Variables:
+          LLM_CONFIG_SECRET: !Ref LLMConfiguration
+          LLM_USAGE_TABLE: !Ref LLMUsageTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref LLMConfiguration
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt LLMUsageTable.Arn
+            - Effect: Allow
+              Action:
+                - ec2:CreateNetworkInterface
+                - ec2:DescribeNetworkInterfaces
+                - ec2:DeleteNetworkInterface
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  'aws:RequestedRegion': !Ref 'AWS::Region'
+  DocumentUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-document-upload"
+      CodeUri: src/document_upload/
+      Handler: app.lambda_handler
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RagApi
+            Path: /upload
+            Method: POST
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET: !Ref DocumentsBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref DocumentsBucket
+
+  # Secrets Manager for LLM Configuration
+  LLMConfiguration:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-llm-config"
+      Description: LLM configuration including API keys and endpoints
+      SecretString: !Sub |
+        {
+          "external_api_key": "REPLACE_WITH_YOUR_EXTERNAL_API_KEY",
+          "external_endpoint": "${ExternalLLMApiEndpoint}",
+          "onprem_endpoint": "${OnPremLLMEndpoint}",
+          "onprem_api_key": "REPLACE_WITH_YOUR_ONPREM_API_KEY",
+          "llm_type": "${LLMType}",
+          "load_balancing_strategy": "${LoadBalancingStrategy}",
+          "timeout_seconds": 60,
+          "retry_attempts": 3
+        }
+
+  # DynamoDB table for LLM usage tracking and load balancing
+  LLMUsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-llm-usage"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: endpoint_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: endpoint_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # CloudWatch Log Groups
+  DocumentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${DocumentProcessorFunction}"
+      RetentionInDays: 14
+
+  QueryProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${QueryProcessorFunction}"
+      RetentionInDays: 14
+
+  # CloudWatch Dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-monitoring"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${DocumentProcessorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${DocumentProcessorFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${DocumentProcessorFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Document Processor Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${QueryProcessorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${QueryProcessorFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${QueryProcessorFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Query Processor Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${AWS::StackName}-api"],
+                  ["AWS/ApiGateway", "4XXError", "ApiName", "${AWS::StackName}-api"],
+                  ["AWS/ApiGateway", "5XXError", "ApiName", "${AWS::StackName}-api"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-high-error-rate"
+      AlarmDescription: High error rate in Lambda functions
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QueryProcessorFunction
+
+  # SNS Topic for Alerts
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${RagApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-api-endpoint"
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-user-pool-id"
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-user-pool-client-id"
+
+  DocumentsBucketName:
+    Description: S3 bucket for document storage
+    Value: !Ref DocumentsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-documents-bucket"
+
+  OpenSearchEndpoint:
+    Description: OpenSearch collection endpoint
+    Value: !GetAtt OpenSearchCollection.CollectionEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-opensearch-endpoint"
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-monitoring"

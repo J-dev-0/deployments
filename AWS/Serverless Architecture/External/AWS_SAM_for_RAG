@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  
+  ExternalLLMApiEndpoint:
+    Type: String
+    Description: External LLM API endpoint (e.g., OpenAI, Anthropic)
+  
+  SSODomain:
+    Type: String
+    Description: SSO domain for authentication
+  
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: "https://localhost:3000"
+    Description: Allowed CORS origins
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        VECTOR_INDEX_NAME: !Sub "${AWS::StackName}-vectors"
+        DOCUMENTS_BUCKET: !Ref DocumentsBucket
+        EXTERNAL_LLM_ENDPOINT: !Ref ExternalLLMApiEndpoint
+
+Resources:
+  # S3 Bucket for Document Storage
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-documents-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentProcessorFunction.Arn
+
+  # OpenSearch Serverless Collection
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Name: !Sub "${AWS::StackName}-vectors"
+      Type: VECTORSEARCH
+      Description: Vector search collection for RAG application
+
+  # Cognito User Pool for Authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${AWS::StackName}-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # API Gateway
+  RagApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: !Sub "'${AllowedOrigins}'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigins}'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigins}'"
+
+  # Lambda Functions
+  DocumentProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-document-processor"
+      CodeUri: src/document_processor/
+      Handler: app.lambda_handler
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref DocumentsBucket
+            Events: s3:ObjectCreated:*
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentsBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - aoss:APIAccessAll
+              Resource: !GetAtt OpenSearchCollection.Arn
+
+  QueryProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-query-processor"
+      CodeUri: src/query_processor/
+      Handler: app.lambda_handler
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RagApi
+            Path: /query
+            Method: POST
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          LLM_API_KEY_SECRET: !Ref ExternalLLMApiKey
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - aoss:APIAccessAll
+              Resource: !GetAtt OpenSearchCollection.Arn
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref ExternalLLMApiKey
+
+  EmbeddingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-embedding-generator"
+      CodeUri: src/embedding_generator/
+      Handler: app.lambda_handler
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          LLM_API_KEY_SECRET: !Ref ExternalLLMApiKey
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref ExternalLLMApiKey
+
+  # Document Upload Function
+  DocumentUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-document-upload"
+      CodeUri: src/document_upload/
+      Handler: app.lambda_handler
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RagApi
+            Path: /upload
+            Method: POST
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET: !Ref DocumentsBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref DocumentsBucket
+
+  # Secrets Manager for External LLM API Key
+  ExternalLLMApiKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-llm-api-key"
+      Description: API key for external LLM service
+      SecretString: !Sub |
+        {
+          "api_key": "REPLACE_WITH_YOUR_API_KEY",
+          "endpoint": "${ExternalLLMApiEndpoint}"
+        }
+
+  # CloudWatch Log Groups
+  DocumentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${DocumentProcessorFunction}"
+      RetentionInDays: 14
+
+  QueryProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${QueryProcessorFunction}"
+      RetentionInDays: 14
+
+  # CloudWatch Dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-monitoring"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${DocumentProcessorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${DocumentProcessorFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${DocumentProcessorFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Document Processor Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${QueryProcessorFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${QueryProcessorFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${QueryProcessorFunction}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Query Processor Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "${AWS::StackName}-api"],
+                  ["AWS/ApiGateway", "4XXError", "ApiName", "${AWS::StackName}-api"],
+                  ["AWS/ApiGateway", "5XXError", "ApiName", "${AWS::StackName}-api"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-high-error-rate"
+      AlarmDescription: High error rate in Lambda functions
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QueryProcessorFunction
+
+  # SNS Topic for Alerts
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${RagApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-api-endpoint"
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-user-pool-id"
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-user-pool-client-id"
+
+  DocumentsBucketName:
+    Description: S3 bucket for document storage
+    Value: !Ref DocumentsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-documents-bucket"
+
+  OpenSearchEndpoint:
+    Description: OpenSearch collection endpoint
+    Value: !GetAtt OpenSearchCollection.CollectionEndpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-opensearch-endpoint"
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-monitoring"
